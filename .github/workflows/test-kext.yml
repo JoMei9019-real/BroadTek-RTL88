@@ -19,7 +19,7 @@ jobs:
         run: |
           plutil -lint build/out/BroadTek.kext/Contents/Info.plist
           binary=build/out/BroadTek.kext/Contents/MacOS/BroadTek
-          lipo -verify_arch x86_64 "$binary"
+          lipo "$binary" -verify_arch x86_64
           if nm -u "$binary" | grep -E ' _bt_legacy_adv_'; then
             exit 1
           fi
