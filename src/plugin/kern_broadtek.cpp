@@ -101,6 +101,7 @@ static bool g_legacy_pending;
 static OSNumber *g_n_legacy_replies;
 static OSNumber *g_n_legacy_status;
 static OSNumber *g_n_legacy_pipe_lookup_failures;
+static OSNumber *g_n_legacy_supported_commands;
 /* Set once an Intel Bluetooth device appears on USB (or by -broadtekintel). */
 static volatile bool g_intel;
 static volatile SInt32 g_intel_inj_pending;
@@ -1269,10 +1270,13 @@ static void completionTrampoline(void *owner, void *parameter, IOReturn status, 
                 noteAdvEvent(buf, len);
                 noteNearby(buf, len);
 
-                /* bluetoothd can submit this read before it sends the command
-                 * that binds the event pipe. Check the owner at completion. */
+                /* The read can be in flight when the command path binds the
+                 * event pipe. Check the pipe identity at completion. */
                 if (g_legacy_requested &&
                     s->pipe == __atomic_load_n(&g_legacy_event_pipe, __ATOMIC_ACQUIRE)) {
+                    if (bt_legacy_adv_add_supported_commands(buf, len) && writeMD(md, buf, len)) {
+                        if (g_n_legacy_supported_commands) g_n_legacy_supported_commands->addValue(1);
+                    }
                     size_t rewritten = legacyReply(s->pipe, buf, len, room);
                     if (rewritten != 0) {
                         noteAdvEvent(buf, rewritten);
@@ -2236,9 +2240,11 @@ static bool legacyDeviceRequest(void *that, IOService *forClient,
         IOSimpleLockUnlock(g_lock);
         return false;
     }
-    if (opcode < 0x2035 || opcode > 0x203d || !isRTL8821C(device) ||
+    const bool readCommands = opcode == BT_HCI_READ_LOCAL_SUPPORTED_COMMANDS && len == 3 && command[2] == 0;
+    if ((!readCommands && (opcode < 0x2035 || opcode > 0x203d)) || !isRTL8821C(device) ||
         !bindLegacyEventPipe(device, forClient))
         return false;
+    if (readCommands) return false;
 
     bt_legacy_adv_request prepared;
     IOSimpleLockLock(g_lock);
@@ -2708,6 +2714,7 @@ void BRTK::init()
         g_n_legacy_status = makeCounter("broadtek-rtl8821c-status");
         if (g_n_legacy_status) g_n_legacy_status->setValue(0xff);
         g_n_legacy_pipe_lookup_failures = makeCounter("broadtek-rtl8821c-pipe-lookup-failures");
+        g_n_legacy_supported_commands = makeCounter("broadtek-rtl8821c-supported-commands");
         if (IOService::addMatchingNotification(gIOMatchedNotification,
                        IOService::serviceMatching("IOUSBHostDevice"),
                        onLegacyCandidate, nullptr, nullptr, 0) == nullptr) {

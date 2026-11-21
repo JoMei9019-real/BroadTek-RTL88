@@ -7,6 +7,7 @@
 
 #define BT_LEGACY_ADV_COMMAND_MAX 35
 #define BT_LEGACY_ADV_EVENT_MAX 8
+#define BT_HCI_READ_LOCAL_SUPPORTED_COMMANDS 0x1002
 
 struct bt_legacy_adv {
     uint8_t configured;
@@ -31,6 +32,7 @@ struct bt_legacy_adv_request {
 
 int bt_legacy_adv_usb_match(uint16_t vendor, uint16_t product);
 void bt_legacy_adv_reset(struct bt_legacy_adv *state);
+int bt_legacy_adv_add_supported_commands(uint8_t *event, size_t length);
 int bt_legacy_adv_prepare(const struct bt_legacy_adv *state, const uint8_t *packet,
                           size_t length, struct bt_legacy_adv_request *request);
 /* Returns the rewritten event size, or zero for an unrelated event. */

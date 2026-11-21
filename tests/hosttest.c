@@ -750,6 +750,27 @@ static void test_legacy_advertising(void)
           "return the controller error and command credit on Command Status");
 }
 
+static void test_legacy_advertising_command_mask(void)
+{
+    uint8_t event[70] = {0x0e, 68, 1, 0x02, 0x10, 0};
+    event[6 + 36] = 1;       /* Preserve the transmitter test bit. */
+    event[6 + 38] = 0x80;    /* Preserve the transmitter power command. */
+    uint8_t expected[sizeof(event)];
+    memcpy(expected, event, sizeof(event));
+    expected[6 + 36] = 0xff;
+    expected[6 + 37] = 0x03;
+
+    CHECK(!bt_legacy_adv_add_supported_commands(event, sizeof(event) - 1), "ignore a short reply");
+    event[5] = 1;
+    CHECK(!bt_legacy_adv_add_supported_commands(event, sizeof(event)), "ignore controller errors");
+    event[5] = 0;
+    event[3] = 0x03;
+    CHECK(!bt_legacy_adv_add_supported_commands(event, sizeof(event)), "ignore unrelated HCI replies");
+    event[3] = 0x02;
+    CHECK(bt_legacy_adv_add_supported_commands(event, sizeof(event)), "update the supported command mask");
+    hexdiff("only translated advertising commands are added", event, expected, sizeof(event));
+}
+
 int main(void)
 {
     printf("BroadTek core test\n");
@@ -771,6 +792,7 @@ int main(void)
     test_install_full();
     test_install_map();
     test_legacy_advertising();
+    test_legacy_advertising_command_mask();
     if (fails) { printf("%d failure(s)\n", fails); return 1; }
     printf("all checks passed\n");
     return 0;

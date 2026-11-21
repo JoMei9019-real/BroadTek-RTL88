@@ -45,6 +45,21 @@ static uint16_t le16(const uint8_t *bytes)
     return (uint16_t)(bytes[0] | (bytes[1] << 8));
 }
 
+int bt_legacy_adv_add_supported_commands(uint8_t *event, size_t length)
+{
+    if (length != 70 || event[0] != 0x0e || event[1] != 68 ||
+        le16(event + 3) != BT_HCI_READ_LOCAL_SUPPORTED_COMMANDS || event[5] != 0)
+        return 0;
+
+    /* Vol 4, Part E, Supported Commands: report the operations the shim
+     * translates (0x2035 through 0x203d). Keep the physical LE features and
+     * the extended scan/create-connection bits as reported by the chip. */
+    uint8_t *commands = event + 6;
+    commands[36] |= 0xfe;
+    commands[37] |= 0x03;
+    return 1;
+}
+
 static void set_command(struct bt_legacy_adv_request *request, uint16_t opcode,
                         uint8_t parameter_length)
 {

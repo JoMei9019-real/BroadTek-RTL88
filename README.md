@@ -84,7 +84,9 @@ On a working setup, `broadtek-rtl8821c-command-hook` and
 `broadtek-rtl8821c-pipe-hook` show `Yes`. The
 `broadtek-rtl8821c-event-pipe` appears when BroadTek binds the controller's
 event endpoint. `broadtek-rtl8821c-pipe-lookup-failures` counts attempts to
-bind that endpoint that did not succeed.
+bind that endpoint that did not succeed. The counter
+`broadtek-rtl8821c-supported-commands` increments when the HCI reply lists
+the advertising commands translated by BroadTek.
 
 Compare the BroadTek reply counter before and after opening AirDrop on the
 Mac. Then check iPhone discovery and transfer a small file in each direction
