@@ -19,6 +19,7 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/usb/IOUSBHostDevice.h>
+#include <IOKit/usb/IOUSBHostInterface.h>
 #include <IOKit/usb/IOUSBHostPipe.h>
 #include <IOKit/usb/StandardUSB.h>
 
@@ -91,7 +92,6 @@ static IOSimpleLock *g_lock;
 static bool g_adv_addr;
 static bool g_legacy_requested;
 static bool g_legacy_device_present;
-static mach_vm_address_t g_orig_legacy_pipe_init;
 static IOUSBHostPipe *g_legacy_event_pipe;
 static IOUSBHostDevice *g_legacy_device;
 static bt_legacy_adv g_legacy_adv;
@@ -100,6 +100,7 @@ static uint32_t g_legacy_generation;
 static bool g_legacy_pending;
 static OSNumber *g_n_legacy_replies;
 static OSNumber *g_n_legacy_status;
+static OSNumber *g_n_legacy_pipe_lookup_failures;
 /* Set once an Intel Bluetooth device appears on USB (or by -broadtekintel). */
 static volatile bool g_intel;
 static volatile SInt32 g_intel_inj_pending;
@@ -1088,33 +1089,6 @@ static bool isRTL8821C(IOService *device)
            bt_legacy_adv_usb_match(vendor->unsigned16BitValue(), product->unsigned16BitValue());
 }
 
-static bool onLegacyPipeInit(IOUSBHostPipe *pipe, const StandardUSB::EndpointDescriptor *descriptor,
-                            const StandardUSB::SuperSpeedEndpointCompanionDescriptor *companion,
-                            AppleUSBHostController *controller, IOUSBHostDevice *device,
-                            IOUSBHostInterface *interface, UInt8 speed, tUSBHostDeviceAddress address)
-{
-    bool ok = FunctionCast(onLegacyPipeInit, g_orig_legacy_pipe_init)(pipe, descriptor, companion,
-                                                                      controller, device, interface,
-                                                                      speed, address);
-    bool matched = ok && descriptor && descriptor->bEndpointAddress == kBtEventEndpoint &&
-                   (descriptor->bmAttributes & 3) == kIOUSBEndpointTypeInterrupt && isRTL8821C(device);
-    if (matched || pipe == __atomic_load_n(&g_legacy_event_pipe, __ATOMIC_ACQUIRE)) {
-        IOSimpleLockLock(g_lock);
-        if (matched || pipe == __atomic_load_n(&g_legacy_event_pipe, __ATOMIC_RELAXED)) {
-            g_legacy_device = matched ? device : nullptr;
-            g_legacy_pending = false;
-            bt_legacy_adv_reset(&g_legacy_adv);
-            __atomic_store_n(&g_legacy_event_pipe, matched ? pipe : nullptr, __ATOMIC_RELEASE);
-        }
-        IOSimpleLockUnlock(g_lock);
-        if (matched) {
-            if (auto platform = IOService::getPlatform())
-                platform->setProperty("broadtek-rtl8821c-event-pipe", true);
-        }
-    }
-    return ok;
-}
-
 static bool isEventPipe(IOUSBHostPipe *pipe)
 {
     if (pipe == nullptr) return false;
@@ -1170,7 +1144,7 @@ static bool isOtherDeviceInPipe(IOUSBHostPipe *pipe)
  * to sit in the completion. Each in-flight transfer borrows a slot; if they
  * all run out the transfer is left alone rather than queued or dropped. */
 
-enum SlotKind { kSlotEvent, kSlotLegacyEvent, kSlotAcl, kSlotOwnedBuffer };
+enum SlotKind { kSlotEvent, kSlotAcl, kSlotOwnedBuffer };
 
 struct Slot {
     volatile SInt32 busy;
@@ -1295,13 +1269,18 @@ static void completionTrampoline(void *owner, void *parameter, IOReturn status, 
                 noteAdvEvent(buf, len);
                 noteNearby(buf, len);
 
-                if (s->kind == kSlotLegacyEvent) {
+                /* bluetoothd can submit this read before it sends the command
+                 * that binds the event pipe. Check the owner at completion. */
+                if (g_legacy_requested &&
+                    s->pipe == __atomic_load_n(&g_legacy_event_pipe, __ATOMIC_ACQUIRE)) {
                     size_t rewritten = legacyReply(s->pipe, buf, len, room);
                     if (rewritten != 0) {
                         noteAdvEvent(buf, rewritten);
-                        if (writeMD(md, buf, rewritten)) deliver = static_cast<uint32_t>(rewritten);
-                        if (g_n_legacy_replies != nullptr) g_n_legacy_replies->addValue(1);
-                        if (g_n_legacy_status != nullptr) g_n_legacy_status->setValue(buf[5]);
+                        if (writeMD(md, buf, rewritten)) {
+                            deliver = static_cast<uint32_t>(rewritten);
+                            if (g_n_legacy_replies != nullptr) g_n_legacy_replies->addValue(1);
+                            if (g_n_legacy_status != nullptr) g_n_legacy_status->setValue(buf[5]);
+                        }
                         s->md = nullptr;
                         OSDecrementAtomic(&s->busy);
                         if (orig.action != nullptr)
@@ -1698,10 +1677,9 @@ static IOReturn onIOAsync(IOUSBHostPipe *that, IOMemoryDescriptor *dataBuffer,
     if (g_n_io_calls != nullptr) g_n_io_calls->setValue(g_io_calls);
     if (that != nullptr) noteEndpoint(that->getEndpointDescriptor());
 
-    if (completion != nullptr && isEventPipe(that)) {
-        bool legacy = that == __atomic_load_n(&g_legacy_event_pipe, __ATOMIC_ACQUIRE);
-        use = borrowSlot(completion, dataBuffer, &wrapper, legacy ? kSlotLegacyEvent : kSlotEvent, that);
-    } else if (completion != nullptr && isAclInPipe(that))
+    if (completion != nullptr && isEventPipe(that))
+        use = borrowSlot(completion, dataBuffer, &wrapper, kSlotEvent, that);
+    else if (completion != nullptr && isAclInPipe(that))
         use = borrowSlot(completion, dataBuffer, &wrapper, kSlotAcl);
     else if (isAclOutPipe(that) && dataBuffer != nullptr) {
         /* OUT buffer: filled before the transfer, so it reads here. */
@@ -1714,8 +1692,14 @@ static IOReturn onIOAsync(IOUSBHostPipe *that, IOMemoryDescriptor *dataBuffer,
         if (g_n_pipes_elsewhere != nullptr) g_n_pipes_elsewhere->setValue(g_pipes_elsewhere);
     }
 
-    return FunctionCast(onIOAsync, g_orig_io_async)(that, dataBuffer, dataBufferLength,
-                                                    use, timeout);
+    IOReturn result = FunctionCast(onIOAsync, g_orig_io_async)(that, dataBuffer, dataBufferLength,
+                                                               use, timeout);
+    if (result != kIOReturnSuccess && use == &wrapper) {
+        auto slot = static_cast<Slot *>(wrapper.parameter);
+        slot->md = nullptr;
+        OSDecrementAtomic(&slot->busy);
+    }
+    return result;
 }
 
 /* Caller context, bluetoothd's own thread: it may block. */
@@ -2178,6 +2162,59 @@ static IOReturn onDeviceRequest(void *that, IOService *forClient,
                                 uint32_t &bytesTransferred,
                                 IOUSBHostCompletion *completion, uint32_t timeout);
 
+static IOUSBHostInterface *legacyControlInterface(OSObject *entry, IOUSBHostDevice *device)
+{
+    auto interface = entry ? static_cast<IOUSBHostInterface *>(entry->metaCast("IOUSBHostInterface")) : nullptr;
+    if (!interface || interface->getProvider() != device) return nullptr;
+    auto number = OSDynamicCast(OSNumber, interface->getProperty(kUSBHostMatchingPropertyInterfaceNumber));
+    return number && number->unsigned8BitValue() == 0 ? interface : nullptr;
+}
+
+/* Resolve the exact event pipe through the target device's HCI interface.
+ * copyPipe retains the pipe. Keep that reference while its identity is used
+ * by completion callbacks, and release it on replacement or termination. */
+static bool bindLegacyEventPipe(IOUSBHostDevice *device, IOService *client)
+{
+    IOUSBHostPipe *pipe = nullptr;
+    if (auto interface = legacyControlInterface(client, device)) {
+        pipe = interface->copyPipe(kBtEventEndpoint);
+    } else if (auto children = device->getChildIterator(gIOServicePlane)) {
+        while (auto child = children->getNextObject()) {
+            if (auto candidate = legacyControlInterface(child, device)) {
+                pipe = candidate->copyPipe(kBtEventEndpoint);
+                break;
+            }
+        }
+        children->release();
+    }
+    if (!isEventPipe(pipe)) {
+        if (pipe) pipe->release();
+        if (g_n_legacy_pipe_lookup_failures) g_n_legacy_pipe_lookup_failures->addValue(1);
+        return false;
+    }
+
+    IOSimpleLockLock(g_lock);
+    if (device->isInactive()) {
+        IOSimpleLockUnlock(g_lock);
+        pipe->release();
+        return false;
+    }
+    auto previous = __atomic_load_n(&g_legacy_event_pipe, __ATOMIC_RELAXED);
+    if (pipe != previous || device != g_legacy_device) {
+        g_legacy_device = device;
+        g_legacy_pending = false;
+        bt_legacy_adv_reset(&g_legacy_adv);
+        __atomic_store_n(&g_legacy_event_pipe, pipe, __ATOMIC_RELEASE);
+    }
+    IOSimpleLockUnlock(g_lock);
+    if (previous) previous->release();
+    if (pipe != previous) {
+        if (auto platform = IOService::getPlatform())
+            platform->setProperty("broadtek-rtl8821c-event-pipe", true);
+    }
+    return true;
+}
+
 /* Called on the outgoing USB request for the matched controller. The original
  * submission still accounts for USB completion. HCI credit and controller
  * status come back on the controller's own interrupt pipe. */
@@ -2186,19 +2223,26 @@ static bool legacyDeviceRequest(void *that, IOService *forClient,
                                 const uint8_t *command, size_t len, uint32_t &bytesTransferred,
                                 IOUSBHostCompletion *completion, uint32_t timeout, IOReturn &result)
 {
-    if (!g_legacy_requested || len != request.wLength) return false;
+    if (!g_legacy_requested || !g_orig_io_async || len != request.wLength) return false;
 
-    bt_legacy_adv_request prepared;
-    IOSimpleLockLock(g_lock);
-    if (that != g_legacy_device) {
+    auto device = static_cast<IOUSBHostDevice *>(that);
+    uint16_t opcode = static_cast<uint16_t>(command[0] | (command[1] << 8));
+    if (opcode == 0x0c03 && len == 3 && command[2] == 0) {
+        IOSimpleLockLock(g_lock);
+        if (device == g_legacy_device) {
+            bt_legacy_adv_reset(&g_legacy_adv);
+            g_legacy_pending = false;
+        }
         IOSimpleLockUnlock(g_lock);
         return false;
     }
-    if (len == 3 && command[0] == 0x03 && command[1] == 0x0c && command[2] == 0) {
-        bt_legacy_adv_reset(&g_legacy_adv);
-        g_legacy_pending = false;
-    }
-    if (!bt_legacy_adv_prepare(&g_legacy_adv, command, len, &prepared)) {
+    if (opcode < 0x2035 || opcode > 0x203d || !isRTL8821C(device) ||
+        !bindLegacyEventPipe(device, forClient))
+        return false;
+
+    bt_legacy_adv_request prepared;
+    IOSimpleLockLock(g_lock);
+    if (device != g_legacy_device || !bt_legacy_adv_prepare(&g_legacy_adv, command, len, &prepared)) {
         IOSimpleLockUnlock(g_lock);
         return false;
     }
@@ -2566,7 +2610,7 @@ static void onCsValidatePage(vnode_t vp, memory_object_t pager, memory_object_of
     if (!vp || !data || vn_getpath(vp, path, &len) != 0 || strcmp(path, "/usr/sbin/bluetoothd") != 0)
         return;
     if (g_legacy_requested && (!__atomic_load_n(&g_legacy_device_present, __ATOMIC_ACQUIRE) ||
-                              !g_orig_legacy_pipe_init || !g_orig_dev_req || !g_orig_io_async))
+                              !g_orig_dev_req || !g_orig_io_async))
         return;
     for (const auto &patch : g_btd_patches) {
         const auto *replacement = g_legacy_requested && patch.find == g_count_find ?
@@ -2592,6 +2636,24 @@ static bool onLegacyCandidate(void *, void *, IOService *device, IONotifier *)
     if (isRTL8821C(device)) {
         __atomic_store_n(&g_legacy_device_present, true, __ATOMIC_RELEASE);
         mark("broadtek-rtl8821c-usb", true);
+    }
+    return true;
+}
+
+static bool onLegacyTermination(void *, void *, IOService *device, IONotifier *)
+{
+    IOUSBHostPipe *pipe = nullptr;
+    IOSimpleLockLock(g_lock);
+    if (device == g_legacy_device) {
+        pipe = __atomic_exchange_n(&g_legacy_event_pipe, nullptr, __ATOMIC_ACQ_REL);
+        g_legacy_device = nullptr;
+        g_legacy_pending = false;
+        bt_legacy_adv_reset(&g_legacy_adv);
+    }
+    IOSimpleLockUnlock(g_lock);
+    if (pipe) {
+        pipe->release();
+        mark("broadtek-rtl8821c-event-pipe", false);
     }
     return true;
 }
@@ -2644,10 +2706,17 @@ void BRTK::init()
         mark("broadtek-rtl8821c-requested", true);
         g_n_legacy_replies = makeCounter("broadtek-rtl8821c-replies");
         g_n_legacy_status = makeCounter("broadtek-rtl8821c-status");
+        if (g_n_legacy_status) g_n_legacy_status->setValue(0xff);
+        g_n_legacy_pipe_lookup_failures = makeCounter("broadtek-rtl8821c-pipe-lookup-failures");
         if (IOService::addMatchingNotification(gIOMatchedNotification,
                        IOService::serviceMatching("IOUSBHostDevice"),
                        onLegacyCandidate, nullptr, nullptr, 0) == nullptr) {
             SYSLOG("broadtek", "RTL8821C: USB notification registration failed");
+        }
+        if (g_lock && IOService::addMatchingNotification(gIOTerminatedNotification,
+                       IOService::serviceMatching("IOUSBHostDevice"),
+                       onLegacyTermination, nullptr, nullptr, 0) == nullptr) {
+            SYSLOG("broadtek", "RTL8821C: USB termination notification registration failed");
         }
     }
 
@@ -2747,8 +2816,7 @@ void BRTK::init()
         }, this);
 }
 
-/* Both callbacks come here; whichever arrives first and resolves the symbols
- * wins, and the other does nothing. */
+/* Either callback can resolve symbols. Only retry the routes still missing. */
 void BRTK::installRoutes(KernelPatcher &patcher, size_t id,
                          mach_vm_address_t start, size_t size, const char *via)
 {
@@ -2756,8 +2824,6 @@ void BRTK::installRoutes(KernelPatcher &patcher, size_t id,
         SYSLOG("broadtek", "no lock, staying out of the way");
         return;
     }
-    if (g_routed > 0) return;
-
     KernelPatcher::RouteRequest routes[] = {
         { "__ZN13IOUSBHostPipe14controlRequestEP9IOServiceRN11StandardUSB13DeviceRequestEP18IOMemoryDescriptorP19IOUSBHostCompletionj",
           onControlRequestAsync, g_orig_ctrl_async },
@@ -2788,6 +2854,7 @@ void BRTK::installRoutes(KernelPatcher &patcher, size_t id,
     /* One at a time: a symbol that cannot be found must not take the others
      * down with it. */
     for (auto &r : routes) {
+        if (*r.org) continue;
         if (patcher.routeMultiple(id, &r, 1, start, size)) {
             g_routed++;
         } else {
@@ -2796,14 +2863,9 @@ void BRTK::installRoutes(KernelPatcher &patcher, size_t id,
         }
     }
 
-    if (g_legacy_requested && g_orig_dev_req && g_orig_io_async) {
-        KernelPatcher::RouteRequest route {
-            "__ZN13IOUSBHostPipe28initWithDescriptorsAndOwnersEPKN11StandardUSB18EndpointDescriptorEPKNS0_"
-            "37SuperSpeedEndpointCompanionDescriptorEP22AppleUSBHostControllerP15IOUSBHostDeviceP18IOUSBHostInterfaceht",
-            onLegacyPipeInit, g_orig_legacy_pipe_init
-        };
-        if (!patcher.routeMultiple(id, &route, 1, start, size)) patcher.clearError();
-        mark("broadtek-rtl8821c-pipe-hook", g_orig_legacy_pipe_init != 0);
+    if (g_legacy_requested) {
+        mark("broadtek-rtl8821c-command-hook", g_orig_dev_req != 0);
+        mark("broadtek-rtl8821c-pipe-hook", g_orig_io_async != 0);
     }
 
     IORegistryEntry *platform = IOService::getPlatform();
@@ -2834,7 +2896,6 @@ void BRTK::onPatcherLoad(KernelPatcher &patcher)
             patcher.clearError();
         }
     }
-    /* Only as a fallback: if the kext callback has already routed, this does
-     * nothing. */
+    /* Try symbols that the kext callback has not routed yet. */
     installRoutes(patcher, KernelPatcher::KernelID, 0, 0, "kernel");
 }
