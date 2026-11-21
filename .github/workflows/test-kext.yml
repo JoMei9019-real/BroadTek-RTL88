@@ -1,0 +1,32 @@
+name: BroadTek test kext
+
+on:
+  push:
+    branches: [rtl8821ce-legacy-advertising]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run host tests and build the kext
+        run: make kext DEBUG=0
+      - name: Verify the x86_64 bundle
+        run: |
+          plutil -lint build/out/BroadTek.kext/Contents/Info.plist
+          binary=build/out/BroadTek.kext/Contents/MacOS/BroadTek
+          lipo -verify_arch x86_64 "$binary"
+          if nm -u "$binary" | grep -E ' _bt_legacy_adv_'; then
+            exit 1
+          fi
+          cd build/out
+          zip -qry BroadTek-RTL8821CE-test.zip BroadTek.kext
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BroadTek-RTL8821CE-test
+          path: build/out/BroadTek-RTL8821CE-test.zip
+          if-no-files-found: error

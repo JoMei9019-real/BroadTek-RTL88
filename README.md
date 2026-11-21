@@ -56,6 +56,35 @@ Apple Watch on watchOS 26, with two cards: the RTL8852BE (Bluetooth on USB
 It works on the HCI stream, not on one chip, so other USB controllers without
 Apple's firmware should behave much the same, but none has been tried yet.
 
+### RTL8821CE test on Tahoe
+
+The RTL8821C Bluetooth controller in the RTL8821CE uses Bluetooth 4.2.
+On macOS Tahoe 26.7.x, add `-broadtek8821c` to test the single-set Legacy
+Advertising path. It matches the Bluetooth **USB** IDs `0BDA:B00A`,
+`13D3:3529`, `13D3:3533`, and `13D3:3558`. The controller can broadcast
+one advertising set with at most 31 bytes of data. This translation still
+needs a hardware test on RTL8821CE.
+
+Keep `Lilu.kext`, `RealtekBluetoothFirmware.kext`, and `BlueToolFixup.kext`
+for Bluetooth, then add this build of `BroadTek.kext` after Lilu. For AirDrop,
+keep [AirPortRTW 2.0.0 Beta 20](https://github.com/JoMei9019-real/AirPort-RTW/blob/beta-2.0.0/BETA_2_0_0_20_TEST.md)
+for Wi-Fi and AWDL. The Apple Watch helper is separate from this test.
+
+Check your USB ID and the Bluetooth firmware loader first. The loader needs
+the matching USB ID in its own `Info.plist`, even when BroadTek recognizes it.
+
+```sh
+system_profiler SPUSBDataType
+log show --last boot --predicate 'eventMessage CONTAINS "RealtekFirmware"'
+ioreg -l -w0 | grep -Ei 'broadtek-(rtl8821c|btd-pages-patched|adv-status)'
+ifconfig awdl0
+```
+
+Compare the BroadTek reply counter before and after opening AirDrop on the
+Mac. Then check iPhone discovery and transfer a small file in each direction
+with both devices set to Everyone. A successful HCI reply confirms controller
+acceptance. Discovery and file transfers are separate hardware checks.
+
 ### Apple Watch unlock
 
 On the AX210 the Watch approves the "use your Apple Watch to unlock" prompts
@@ -139,6 +168,7 @@ and statuses only. `sudo ./uninstall.sh` removes the helper.
 | | |
 |---|---|
 | `-broadtekoff` | BroadTek does nothing |
+| `-broadtek8821c` | test single-set Legacy Advertising on a matched RTL8821C USB controller |
 | `-broadtekadvaddroff` | leave the adverts' addresses alone |
 | `-broadtekadvoff` | do not patch bluetoothd's advertising check |
 | `-broadtekrw` | the full stage: the software resolving list, needed for Watch unlock |

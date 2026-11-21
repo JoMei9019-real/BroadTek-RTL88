@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "bt_core.h"
+#include "bt_legacy_adv.h"
 
 static int fails;
 
@@ -658,6 +659,97 @@ static void test_install_full(void)
     CHECK(bt_rl_install(&c, 0x00, addr, spec_irk) == 0, "a full list must refuse");
 }
 
+static size_t legacy_reply(struct bt_legacy_adv *state,
+                           const struct bt_legacy_adv_request *request, uint8_t status,
+                           uint8_t event[BT_LEGACY_ADV_EVENT_MAX])
+{
+    const uint8_t reply[] = {0x0e, 4, 1, request->command[0], request->command[1], status};
+    memcpy(event, reply, sizeof(reply));
+    return bt_legacy_adv_complete(state, request, event, sizeof(reply), BT_LEGACY_ADV_EVENT_MAX);
+}
+
+static void test_legacy_advertising(void)
+{
+    struct bt_legacy_adv state;
+    struct bt_legacy_adv_request request;
+    uint8_t event[BT_LEGACY_ADV_EVENT_MAX];
+
+    CHECK(bt_legacy_adv_usb_match(0x0bda, 0xb00a), "match Realtek USB variant");
+    CHECK(bt_legacy_adv_usb_match(0x13d3, 0x3533), "match IMC USB variant");
+    CHECK(!bt_legacy_adv_usb_match(0x13d3, 0x3571), "leave RTL8852BE on the native path");
+
+    bt_legacy_adv_reset(&state);
+    const uint8_t count[] = {0x3b, 0x20, 0};
+    CHECK(bt_legacy_adv_prepare(&state, count, sizeof(count), &request), "translate set-count query");
+    CHECK(request.command[0] == 7 && request.length == 3, "query uses legacy read TX power");
+    uint8_t power[BT_LEGACY_ADV_EVENT_MAX] = {0x0e, 5, 1, 7, 0x20, 0, 0xfd};
+    CHECK(bt_legacy_adv_complete(&state, &request, power, 7, sizeof(power)) == 7 &&
+          power[3] == 0x3b && power[6] == 1 && state.tx_power == 0xfd, "advertise one physical slot");
+
+    uint8_t params[28] = {0x36, 0x20, 25, 2, 0x10, 0, 0xa0, 0, 0, 0xf0, 0, 0, 7, 1};
+    params[22] = 0x7f;
+    params[23] = 1;
+    const uint8_t legacy_params[] = {6, 0x20, 15, 0xa0, 0, 0xf0, 0, 3, 1, 0,
+                                     0, 0, 0, 0, 0, 0, 7, 0};
+    CHECK(bt_legacy_adv_prepare(&state, params, sizeof(params), &request), "translate parameters");
+    CHECK(request.length == sizeof(legacy_params), "legacy command length");
+    hexdiff("legacy advertising parameters", request.command, legacy_params, sizeof(legacy_params));
+    CHECK(legacy_reply(&state, &request, 0x0c, event) == 7 &&
+          event[5] == 0x0c && !state.configured, "controller rejection leaves the slot free");
+    uint8_t unrelated[] = {0x0e, 4, 1, 5, 0x20, 0};
+    CHECK(!bt_legacy_adv_complete(&state, &request, unrelated, sizeof(unrelated), sizeof(unrelated)),
+          "another command's event must pass through");
+    CHECK(legacy_reply(&state, &request, 0, event) == 7 && event[6] == 0xfd &&
+          state.configured && state.handle == 2, "accept only after successful completion");
+
+    params[3] = 3;
+    CHECK(bt_legacy_adv_prepare(&state, params, sizeof(params), &request) &&
+          legacy_reply(&state, &request, 0, event) == 7 && event[5] == 7,
+          "a second set cannot take the physical slot");
+
+    const uint8_t addr[] = {0x35, 0x20, 7, 2, 0xaa, 0xfb, 0x0d, 0x94, 0x81, 0x70};
+    CHECK(bt_legacy_adv_prepare(&state, addr, sizeof(addr), &request) &&
+          request.command[0] == 5 && request.length == 9, "use the legacy random address register");
+    hexdiff("advertising random address", request.command + 3, addr + 4, 6);
+    CHECK(legacy_reply(&state, &request, 0, event) == 6 && event[3] == 0x35,
+          "return the original address opcode");
+
+    uint8_t data[] = {0x37, 0x20, 12, 2, 3, 1, 8, 7, 0xff, 0x4c, 0, 0x10, 2, 0x0b, 0};
+    CHECK(bt_legacy_adv_prepare(&state, data, sizeof(data), &request) &&
+          request.length == 35 && request.command[0] == 8 && request.command[34] == 0,
+          "complete advertising data is padded to the physical command size");
+    hexdiff("legacy payload stays intact", request.command + 4, data + 7, data[6]);
+    CHECK(legacy_reply(&state, &request, 0, event) == 6 && state.data_ready,
+          "record completed advertising data");
+    data[4] = 1;
+    CHECK(bt_legacy_adv_prepare(&state, data, sizeof(data), &request) && request.status == 0x11,
+          "fragmented data is unsupported");
+    uint8_t large[39] = {0x37, 0x20, 36, 2, 3, 1, 32};
+    CHECK(bt_legacy_adv_prepare(&state, large, sizeof(large), &request) && request.status == 0x11,
+          "do not truncate advertising data");
+
+    uint8_t enable[] = {0x39, 0x20, 6, 1, 1, 2, 0, 0, 0};
+    CHECK(bt_legacy_adv_prepare(&state, enable, sizeof(enable), &request) &&
+          request.command[0] == 0x0a && request.command[3] == 1, "enable on the physical slot");
+    CHECK(legacy_reply(&state, &request, 0, event) == 6 && state.enabled,
+          "enable only on controller success");
+    const uint8_t clear[] = {0x3d, 0x20, 0};
+    CHECK(bt_legacy_adv_prepare(&state, clear, sizeof(clear), &request) && request.status == 0x0c,
+          "do not clear a live set");
+    enable[3] = 0;
+    CHECK(bt_legacy_adv_prepare(&state, enable, sizeof(enable), &request) &&
+          legacy_reply(&state, &request, 0, event) == 6 && !state.enabled, "disable the physical slot");
+    CHECK(bt_legacy_adv_prepare(&state, clear, sizeof(clear), &request) &&
+          legacy_reply(&state, &request, 0, event) == 6 && !state.configured && !state.data_ready,
+          "a set cannot inherit stale advertising data");
+
+    uint8_t failed_status[] = {0x0f, 4, 1, 2, 7, 0x20, 0, 0};
+    CHECK(bt_legacy_adv_prepare(&state, count, sizeof(count), &request) &&
+          bt_legacy_adv_complete(&state, &request, failed_status, 6, sizeof(failed_status)) == 7 &&
+          failed_status[0] == 0x0e && failed_status[2] == 2 && failed_status[5] == 1,
+          "return the controller error and command credit on Command Status");
+}
+
 int main(void)
 {
     printf("BroadTek core test\n");
@@ -678,6 +770,7 @@ int main(void)
     test_promote();
     test_install_full();
     test_install_map();
+    test_legacy_advertising();
     if (fails) { printf("%d failure(s)\n", fails); return 1; }
     printf("all checks passed\n");
     return 0;

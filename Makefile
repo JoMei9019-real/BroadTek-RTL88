@@ -21,8 +21,8 @@ MINOS := -mmacosx-version-min=13.0
 CC    := xcrun clang
 CXX   := xcrun clang++
 
-CORE_SRCS := $(CORE)/bt_aes.c $(CORE)/bt_hci.c $(CORE)/bt_smp.c
-CORE_HDRS := $(CORE)/bt_core.h
+CORE_SRCS := $(CORE)/bt_aes.c $(CORE)/bt_hci.c $(CORE)/bt_smp.c $(CORE)/bt_legacy_adv.c
+CORE_HDRS := $(CORE)/bt_core.h $(CORE)/bt_legacy_adv.h
 
 # Which build is actually running is not a rhetorical question: a kext copied
 # from the wrong repository, or not copied at all, looks exactly like one whose
@@ -58,7 +58,7 @@ KEXT_CXXFLAGS := $(ARCH) $(MINOS) -isysroot $(SDK) -nostdinc \
 HOST_CFLAGS := -std=gnu11 -O1 -g -Wall -Wextra -Werror -I$(CORE) \
                -fsanitize=address,undefined -fno-sanitize-recover=all
 
-OBJS := $(BUILD)/obj/bt_aes.o $(BUILD)/obj/bt_hci.o $(BUILD)/obj/bt_smp.o \
+OBJS := $(BUILD)/obj/bt_aes.o $(BUILD)/obj/bt_hci.o $(BUILD)/obj/bt_smp.o $(BUILD)/obj/bt_legacy_adv.o \
         $(BUILD)/obj/kern_broadtek.o $(BUILD)/obj/kern_config.o $(BUILD)/obj/kern_usbclass.o \
         $(BUILD)/obj/kern_start.o \
         $(BUILD)/obj/plugin_start.o $(BUILD)/obj/kmod_info.o
